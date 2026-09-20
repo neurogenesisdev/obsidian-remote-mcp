@@ -54,17 +54,17 @@ const UNUSED_CLIENT_TTL_S = 24 * 3600;
 // page, so a fresh registration is off limits to overflow eviction.
 const REGISTRATION_GRACE_S =
   Number(process.env.REGISTRATION_GRACE_SECONDS) > 0 ? Number(process.env.REGISTRATION_GRACE_SECONDS) : 600;
-// A real client registers once per connect, so this is generous.
-const MAX_REGISTRATIONS_PER_WINDOW =
-  Number(process.env.MAX_REGISTRATIONS_PER_WINDOW) > 0 ? Number(process.env.MAX_REGISTRATIONS_PER_WINDOW) : 10;
-const REGISTRATION_WINDOW_MS = 15 * 60 * 1000;
+const positiveEnv = (name, fallback) => (Number(process.env[name]) > 0 ? Number(process.env[name]) : fallback);
 
+// Both limiters count per source address and globally. The global limits sit
+// well above the per-address ones, so one noisy visitor only blocks itself and
+// the global ceiling is left to protect the hashing and the database.
+const RATE_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 10;
-// Well above the per-address limit, so ten requests from a stranger cannot lock
-// the owner out, while guessing spread over forged addresses is still capped.
-const MAX_LOGIN_ATTEMPTS_GLOBAL =
-  Number(process.env.MAX_LOGIN_ATTEMPTS_GLOBAL) > 0 ? Number(process.env.MAX_LOGIN_ATTEMPTS_GLOBAL) : 100;
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const MAX_LOGIN_ATTEMPTS_GLOBAL = positiveEnv('MAX_LOGIN_ATTEMPTS_GLOBAL', 100);
+// A real client registers once per connect, so this is generous.
+const MAX_REGISTRATIONS_PER_ADDRESS = positiveEnv('MAX_REGISTRATIONS_PER_ADDRESS', 10);
+const MAX_REGISTRATIONS_GLOBAL = positiveEnv('MAX_REGISTRATIONS_GLOBAL', 100);
 
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
@@ -153,38 +153,46 @@ async function verifyPassword(candidate) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Failed logins are counted globally and per source address. The address comes
-// from X-Forwarded-For and can be forged, which is why the global counter exists:
-// it caps guessing no matter how many addresses the guesses claim to come from.
-// Its limit is the higher of the two so that one noisy address only blocks itself.
+// A fixed-window counter per source address plus one global counter. The global
+// one caps the total no matter how many addresses the traffic comes from.
 const GLOBAL_KEY = 'global';
-const loginFailures = new Map();
 
-// Seconds until the given keys may try again, 0 when none of them is blocked.
-function loginRetryAfter(keys) {
-  const t = Date.now();
-  let wait = 0;
-  for (const key of keys) {
-    const entry = loginFailures.get(key);
-    const limit = key === GLOBAL_KEY ? MAX_LOGIN_ATTEMPTS_GLOBAL : LOGIN_MAX_FAILURES;
-    if (!entry || entry.count < limit) continue;
-    wait = Math.max(wait, entry.start + LOGIN_WINDOW_MS - t);
-  }
-  return Math.max(0, Math.ceil(wait / 1000));
+function makeLimiter(perAddressLimit, globalLimit) {
+  const counts = new Map();
+  const keysFor = (source) => [GLOBAL_KEY, `addr:${source}`];
+  return {
+    // Seconds until this source may try again, 0 when it is not blocked.
+    retryAfter(source) {
+      const t = Date.now();
+      let wait = 0;
+      for (const key of keysFor(source)) {
+        const entry = counts.get(key);
+        const limit = key === GLOBAL_KEY ? globalLimit : perAddressLimit;
+        if (!entry || entry.count < limit) continue;
+        wait = Math.max(wait, entry.start + RATE_WINDOW_MS - t);
+      }
+      return Math.max(0, Math.ceil(wait / 1000));
+    },
+    record(source) {
+      const t = Date.now();
+      // Dropping lapsed windows here keeps the map from growing with every address seen.
+      for (const [key, entry] of counts) {
+        if (t - entry.start >= RATE_WINDOW_MS) counts.delete(key);
+      }
+      for (const key of keysFor(source)) {
+        const entry = counts.get(key);
+        if (entry) entry.count += 1;
+        else counts.set(key, { count: 1, start: t });
+      }
+    },
+    reset(source) {
+      for (const key of keysFor(source)) counts.delete(key);
+    },
+  };
 }
 
-function recordLoginFailure(keys) {
-  const t = Date.now();
-  // Dropping lapsed windows here keeps the map from growing with every address seen.
-  for (const [key, entry] of loginFailures) {
-    if (t - entry.start >= LOGIN_WINDOW_MS) loginFailures.delete(key);
-  }
-  for (const key of keys) {
-    const entry = loginFailures.get(key);
-    if (entry) entry.count += 1;
-    else loginFailures.set(key, { count: 1, start: t });
-  }
-}
+const loginLimiter = makeLimiter(LOGIN_MAX_FAILURES, MAX_LOGIN_ATTEMPTS_GLOBAL);
+const registrationLimiter = makeLimiter(MAX_REGISTRATIONS_PER_ADDRESS, MAX_REGISTRATIONS_GLOBAL);
 
 function readStaticToken() {
   try {
@@ -205,7 +213,17 @@ function timingSafeEqualStr(a, b) {
 
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', true);
+// The only proxy in front of this server is tailscaled/Funnel on loopback, which
+// sets X-Forwarded-For to the visitor address. With trust proxy naming that hop,
+// req.ip is the rightmost address in the header that is not a trusted proxy, so
+// a visitor cannot choose their own req.ip by sending the header themselves.
+// TRUST_PROXY takes what Express takes: true, false, a hop count, or addresses.
+function trustProxySetting(value) {
+  if (!value) return 'loopback';
+  if (value === 'true' || value === 'false') return value === 'true';
+  return /^\d+$/.test(value) ? Number(value) : value;
+}
+app.set('trust proxy', trustProxySetting(process.env.TRUST_PROXY));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use(express.json({ limit: '256kb' }));
 
@@ -274,31 +292,17 @@ function redirectUriProblem(uri) {
   return null;
 }
 
-// Every call counts, valid or not, and the count is global: registration is
-// unauthenticated and the source address can be forged.
-const registrationWindow = { count: 0, start: 0 };
-
-// Counts this call and returns the seconds to wait, 0 when it is admitted.
-function registrationRetryAfter() {
-  const t = Date.now();
-  if (t - registrationWindow.start >= REGISTRATION_WINDOW_MS) {
-    registrationWindow.count = 0;
-    registrationWindow.start = t;
-  }
-  if (registrationWindow.count >= MAX_REGISTRATIONS_PER_WINDOW) {
-    return Math.ceil((registrationWindow.start + REGISTRATION_WINDOW_MS - t) / 1000);
-  }
-  registrationWindow.count += 1;
-  return 0;
-}
-
 app.post('/register', cors, (req, res) => {
-  const retryAfter = registrationRetryAfter();
+  // Every call counts, valid or not, and is counted before validation and any
+  // database access: registration is unauthenticated.
+  const source = req.ip || 'unknown';
+  const retryAfter = registrationLimiter.retryAfter(source);
   if (retryAfter > 0) {
-    console.log(`registration rate limited (429) from ${req.ip || 'unknown'}, retry after ${retryAfter}s`);
+    console.log(`registration rate limited (429) from ${source}, retry after ${retryAfter}s`);
     res.set('Retry-After', String(retryAfter));
     return res.status(429).json({ error: 'temporarily_unavailable', error_description: 'too many registrations, try again later' });
   }
+  registrationLimiter.record(source);
 
   const body = req.body || {};
   const redirectUris = body.redirect_uris;
@@ -463,10 +467,9 @@ app.post('/authorize', async (req, res) => {
   const { password, ...rest } = p;
   const requester = describeRequester(p);
   const source = req.ip || 'unknown';
-  const limiterKeys = [GLOBAL_KEY, `addr:${source}`];
 
   // Checked before any hashing, so a blocked source costs nothing to turn away.
-  const retryAfter = loginRetryAfter(limiterKeys);
+  const retryAfter = loginLimiter.retryAfter(source);
   if (retryAfter > 0) {
     console.log(`login rate limited (429) from ${source}, retry after ${retryAfter}s`);
     res.set('Retry-After', String(retryAfter));
@@ -477,12 +480,12 @@ app.post('/authorize', async (req, res) => {
 
   // Counted before the hash rather than after it: hashing is async, so a burst
   // of parallel guesses would otherwise all pass the check above together.
-  recordLoginFailure(limiterKeys);
+  loginLimiter.record(source);
   if (!(await verifyPassword(String(password || '')))) {
     console.log(`login failed from ${source}`);
     return res.status(401).type('html').send(loginPage({ params: rest, error: 'Wrong password.', requester }));
   }
-  for (const key of limiterKeys) loginFailures.delete(key);
+  loginLimiter.reset(source);
 
   const code = newSecret();
   db.prepare(
