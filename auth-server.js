@@ -50,6 +50,14 @@ const MAX_REDIRECT_URIS = 5;
 // A value that does not parse falls back to the default rather than to no cap.
 const MAX_CLIENTS = Number(process.env.MAX_CLIENTS) > 0 ? Number(process.env.MAX_CLIENTS) : 100;
 const UNUSED_CLIENT_TTL_S = 24 * 3600;
+// A client has no code or token while its user is still looking at the login
+// page, so a fresh registration is off limits to overflow eviction.
+const REGISTRATION_GRACE_S =
+  Number(process.env.REGISTRATION_GRACE_SECONDS) > 0 ? Number(process.env.REGISTRATION_GRACE_SECONDS) : 600;
+// A real client registers once per connect, so this is generous.
+const MAX_REGISTRATIONS_PER_WINDOW =
+  Number(process.env.MAX_REGISTRATIONS_PER_WINDOW) > 0 ? Number(process.env.MAX_REGISTRATIONS_PER_WINDOW) : 10;
+const REGISTRATION_WINDOW_MS = 15 * 60 * 1000;
 
 const LOGIN_MAX_FAILURES = 10;
 // Well above the per-address limit, so ten requests from a stranger cannot lock
@@ -266,7 +274,32 @@ function redirectUriProblem(uri) {
   return null;
 }
 
+// Every call counts, valid or not, and the count is global: registration is
+// unauthenticated and the source address can be forged.
+const registrationWindow = { count: 0, start: 0 };
+
+// Counts this call and returns the seconds to wait, 0 when it is admitted.
+function registrationRetryAfter() {
+  const t = Date.now();
+  if (t - registrationWindow.start >= REGISTRATION_WINDOW_MS) {
+    registrationWindow.count = 0;
+    registrationWindow.start = t;
+  }
+  if (registrationWindow.count >= MAX_REGISTRATIONS_PER_WINDOW) {
+    return Math.ceil((registrationWindow.start + REGISTRATION_WINDOW_MS - t) / 1000);
+  }
+  registrationWindow.count += 1;
+  return 0;
+}
+
 app.post('/register', cors, (req, res) => {
+  const retryAfter = registrationRetryAfter();
+  if (retryAfter > 0) {
+    console.log(`registration rate limited (429) from ${req.ip || 'unknown'}, retry after ${retryAfter}s`);
+    res.set('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'temporarily_unavailable', error_description: 'too many registrations, try again later' });
+  }
+
   const body = req.body || {};
   const redirectUris = body.redirect_uris;
   if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
@@ -284,14 +317,16 @@ app.post('/register', cors, (req, res) => {
   if (clientCount >= MAX_CLIENTS) {
     // Make room by dropping the oldest registration nothing was issued to, so a
     // flood of junk registrations cannot shut the real client out. Clients that
-    // hold a code or token are never evicted.
+    // hold a code or token, or are young enough to have a login in progress,
+    // are never evicted.
     const evicted = db.prepare(
       `DELETE FROM clients WHERE client_id = (
          SELECT client_id FROM clients
-          WHERE client_id NOT IN (SELECT client_id FROM codes)
+          WHERE created_at < ?
+            AND client_id NOT IN (SELECT client_id FROM codes)
             AND client_id NOT IN (SELECT client_id FROM tokens)
           ORDER BY created_at, rowid LIMIT 1)`
-    ).run();
+    ).run(now() - REGISTRATION_GRACE_S);
     if (evicted.changes === 0) {
       return res.status(503).json({ error: 'temporarily_unavailable', error_description: 'client registrations are full' });
     }
