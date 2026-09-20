@@ -52,6 +52,10 @@ const MAX_CLIENTS = Number(process.env.MAX_CLIENTS) > 0 ? Number(process.env.MAX
 const UNUSED_CLIENT_TTL_S = 24 * 3600;
 
 const LOGIN_MAX_FAILURES = 10;
+// Well above the per-address limit, so ten requests from a stranger cannot lock
+// the owner out, while guessing spread over forged addresses is still capped.
+const MAX_LOGIN_ATTEMPTS_GLOBAL =
+  Number(process.env.MAX_LOGIN_ATTEMPTS_GLOBAL) > 0 ? Number(process.env.MAX_LOGIN_ATTEMPTS_GLOBAL) : 100;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
@@ -144,6 +148,7 @@ async function verifyPassword(candidate) {
 // Failed logins are counted globally and per source address. The address comes
 // from X-Forwarded-For and can be forged, which is why the global counter exists:
 // it caps guessing no matter how many addresses the guesses claim to come from.
+// Its limit is the higher of the two so that one noisy address only blocks itself.
 const GLOBAL_KEY = 'global';
 const loginFailures = new Map();
 
@@ -153,7 +158,8 @@ function loginRetryAfter(keys) {
   let wait = 0;
   for (const key of keys) {
     const entry = loginFailures.get(key);
-    if (!entry || entry.count < LOGIN_MAX_FAILURES) continue;
+    const limit = key === GLOBAL_KEY ? MAX_LOGIN_ATTEMPTS_GLOBAL : LOGIN_MAX_FAILURES;
+    if (!entry || entry.count < limit) continue;
     wait = Math.max(wait, entry.start + LOGIN_WINDOW_MS - t);
   }
   return Math.max(0, Math.ceil(wait / 1000));
@@ -276,7 +282,19 @@ app.post('/register', cors, (req, res) => {
 
   const { n: clientCount } = db.prepare('SELECT COUNT(*) AS n FROM clients').get();
   if (clientCount >= MAX_CLIENTS) {
-    return res.status(503).json({ error: 'temporarily_unavailable', error_description: 'client registrations are full' });
+    // Make room by dropping the oldest registration nothing was issued to, so a
+    // flood of junk registrations cannot shut the real client out. Clients that
+    // hold a code or token are never evicted.
+    const evicted = db.prepare(
+      `DELETE FROM clients WHERE client_id = (
+         SELECT client_id FROM clients
+          WHERE client_id NOT IN (SELECT client_id FROM codes)
+            AND client_id NOT IN (SELECT client_id FROM tokens)
+          ORDER BY created_at, rowid LIMIT 1)`
+    ).run();
+    if (evicted.changes === 0) {
+      return res.status(503).json({ error: 'temporarily_unavailable', error_description: 'client registrations are full' });
+    }
   }
 
   const clientId = crypto.randomUUID();
