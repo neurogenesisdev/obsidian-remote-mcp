@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const util = require('util');
 const Database = require('better-sqlite3');
 
 const PORT = Number(process.env.PORT || 8422);
@@ -38,6 +39,20 @@ const STATIC_TOKEN_PATH = path.join(CONFIG_DIR, 'token');
 const ACCESS_TOKEN_TTL_S = 3600;
 const REFRESH_TOKEN_TTL_S = 30 * 24 * 3600;
 const AUTH_CODE_TTL_S = 60;
+
+// Registration is unauthenticated, so the hosts a client may send the user back
+// to are fixed by the operator rather than chosen by whoever registers.
+const ALLOWED_REDIRECT_HOSTS = (process.env.ALLOWED_REDIRECT_HOSTS || 'claude.ai,claude.com')
+  .split(',')
+  .map((h) => h.trim().toLowerCase())
+  .filter(Boolean);
+const MAX_REDIRECT_URIS = 5;
+// A value that does not parse falls back to the default rather than to no cap.
+const MAX_CLIENTS = Number(process.env.MAX_CLIENTS) > 0 ? Number(process.env.MAX_CLIENTS) : 100;
+const UNUSED_CLIENT_TTL_S = 24 * 3600;
+
+const LOGIN_MAX_FAILURES = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
@@ -74,6 +89,13 @@ db.exec(`
 
 const now = () => Math.floor(Date.now() / 1000);
 
+// A database from before clients carried a timestamp gets the column here, dated
+// now so existing registrations get the full grace period before any purge.
+if (!db.prepare('PRAGMA table_info(clients)').all().some((c) => c.name === 'created_at')) {
+  db.exec('ALTER TABLE clients ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0');
+  db.prepare('UPDATE clients SET created_at = ?').run(now());
+}
+
 // Tokens are stored hashed: a leaked database should not hand over live
 // credentials the way a plaintext table would.
 const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex');
@@ -83,6 +105,13 @@ function purgeExpired() {
   const t = now();
   db.prepare('DELETE FROM codes WHERE expires_at < ?').run(t);
   db.prepare('DELETE FROM tokens WHERE expires_at < ?').run(t);
+  // A registration nothing was ever issued to, or whose grants have all lapsed,
+  // is dead weight that anyone can create for free.
+  db.prepare(
+    `DELETE FROM clients WHERE created_at < ?
+       AND client_id NOT IN (SELECT client_id FROM codes)
+       AND client_id NOT IN (SELECT client_id FROM tokens)`
+  ).run(t - UNUSED_CLIENT_TTL_S);
 }
 setInterval(purgeExpired, 10 * 60 * 1000).unref();
 purgeExpired();
@@ -97,16 +126,50 @@ function readPasswordHash() {
   }
 }
 
-function verifyPassword(candidate) {
+// Async so a burst of guesses hashes on the thread pool instead of stalling
+// token issuance and proxied calls on the event loop.
+const scrypt = util.promisify(crypto.scrypt);
+
+async function verifyPassword(candidate) {
   const stored = readPasswordHash();
   if (!stored) return false;
   const [salt, expected] = stored.split(':');
   if (!salt || !expected) return false;
-  const actual = crypto.scryptSync(candidate, salt, 64).toString('hex');
-  const a = Buffer.from(actual, 'hex');
+  const a = await scrypt(candidate, salt, 64);
   const b = Buffer.from(expected, 'hex');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+// Failed logins are counted globally and per source address. The address comes
+// from X-Forwarded-For and can be forged, which is why the global counter exists:
+// it caps guessing no matter how many addresses the guesses claim to come from.
+const GLOBAL_KEY = 'global';
+const loginFailures = new Map();
+
+// Seconds until the given keys may try again, 0 when none of them is blocked.
+function loginRetryAfter(keys) {
+  const t = Date.now();
+  let wait = 0;
+  for (const key of keys) {
+    const entry = loginFailures.get(key);
+    if (!entry || entry.count < LOGIN_MAX_FAILURES) continue;
+    wait = Math.max(wait, entry.start + LOGIN_WINDOW_MS - t);
+  }
+  return Math.max(0, Math.ceil(wait / 1000));
+}
+
+function recordLoginFailure(keys) {
+  const t = Date.now();
+  // Dropping lapsed windows here keeps the map from growing with every address seen.
+  for (const [key, entry] of loginFailures) {
+    if (t - entry.start >= LOGIN_WINDOW_MS) loginFailures.delete(key);
+  }
+  for (const key of keys) {
+    const entry = loginFailures.get(key);
+    if (entry) entry.count += 1;
+    else loginFailures.set(key, { count: 1, start: t });
+  }
 }
 
 function readStaticToken() {
@@ -180,24 +243,40 @@ app.get('/.well-known/oauth-authorization-server/mcp', cors, (_req, res) => res.
 
 // --- dynamic client registration (RFC 7591) --------------------------------
 
+// Why a redirect URI is unacceptable, or null. Applied at registration and again
+// at /authorize, so rows registered before the allowlist existed gain nothing.
+function redirectUriProblem(uri) {
+  let parsed;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return `not a URI: ${uri}`;
+  }
+  if (parsed.protocol !== 'https:') return 'redirect_uris must use https';
+  // user@host would show the allowed host on the login page with the rest hidden.
+  if (parsed.username || parsed.password) return 'redirect_uris must not carry credentials';
+  // Exact hostname match - a suffix match would let claude.ai.evil.example in.
+  if (!ALLOWED_REDIRECT_HOSTS.includes(parsed.hostname.toLowerCase())) return 'redirect_uri host is not allowed';
+  return null;
+}
+
 app.post('/register', cors, (req, res) => {
   const body = req.body || {};
   const redirectUris = body.redirect_uris;
   if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
     return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris is required' });
   }
+  if (redirectUris.length > MAX_REDIRECT_URIS) {
+    return res.status(400).json({ error: 'invalid_redirect_uri', error_description: `at most ${MAX_REDIRECT_URIS} redirect_uris` });
+  }
   for (const uri of redirectUris) {
-    let parsed;
-    try {
-      parsed = new URL(uri);
-    } catch {
-      return res.status(400).json({ error: 'invalid_redirect_uri', error_description: `not a URI: ${uri}` });
-    }
-    // OAuth 2.1: redirect URIs must be HTTPS, with localhost the only exception.
-    const isLocalhost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
-    if (parsed.protocol !== 'https:' && !isLocalhost) {
-      return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris must use https, or localhost' });
-    }
+    const problem = redirectUriProblem(uri);
+    if (problem) return res.status(400).json({ error: 'invalid_redirect_uri', error_description: problem });
+  }
+
+  const { n: clientCount } = db.prepare('SELECT COUNT(*) AS n FROM clients').get();
+  if (clientCount >= MAX_CLIENTS) {
+    return res.status(503).json({ error: 'temporarily_unavailable', error_description: 'client registrations are full' });
   }
 
   const clientId = crypto.randomUUID();
@@ -240,7 +319,18 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-function loginPage({ params, error }) {
+// Who is asking and where the user will be sent afterwards, shown on the login
+// page so a link built around someone else's registration does not look like
+// any other sign-in. Only called once the request has been validated.
+function describeRequester(q) {
+  const client = getClient(q.client_id);
+  return {
+    name: (client && client.client_name) || 'An unnamed app',
+    host: new URL(q.redirect_uri).host,
+  };
+}
+
+function loginPage({ params, error, requester }) {
   const hidden = Object.entries(params)
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
     .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`)
@@ -278,7 +368,9 @@ function loginPage({ params, error }) {
       ${hidden}
       <img src="/icon.svg" alt="">
       <h1>Obsidian</h1>
-      <p>Sign in to give this app access to your vault.</p>
+      ${requester
+        ? `<p><strong>${escapeHtml(requester.name)}</strong> wants access to your vault. After signing in you return to <strong>${escapeHtml(requester.host)}</strong>.</p>`
+        : '<p>Sign in to give this app access to your vault.</p>'}
       ${error ? `<p class="err">${escapeHtml(error)}</p>` : ''}
       <label for="password">Password</label>
       <input id="password" type="password" name="password" autofocus autocomplete="current-password" required>
@@ -296,6 +388,7 @@ function validateAuthRequest(q) {
   const allowed = JSON.parse(client.redirect_uris);
   // Exact match only - prefix matching is how open-redirect bugs happen.
   if (!allowed.includes(q.redirect_uri)) return 'redirect_uri does not match a registered value';
+  if (redirectUriProblem(q.redirect_uri)) return 'redirect_uri is no longer allowed';
   if (q.code_challenge_method !== 'S256') return 'code_challenge_method must be S256';
   if (!q.code_challenge) return 'code_challenge is required';
   return null;
@@ -306,18 +399,37 @@ app.get('/authorize', (req, res) => {
   // A bad client_id or redirect_uri must render here, never redirect - bouncing
   // an unvalidated redirect_uri back is the open-redirect the spec warns about.
   if (err) return res.status(400).type('html').send(loginPage({ params: {}, error: err }));
-  res.type('html').send(loginPage({ params: req.query, error: null }));
+  res.type('html').send(loginPage({ params: req.query, error: null, requester: describeRequester(req.query) }));
 });
 
-app.post('/authorize', (req, res) => {
+app.post('/authorize', async (req, res) => {
   const p = req.body || {};
   const err = validateAuthRequest(p);
   if (err) return res.status(400).type('html').send(loginPage({ params: {}, error: err }));
 
-  if (!verifyPassword(String(p.password || ''))) {
-    const { password, ...rest } = p;
-    return res.status(401).type('html').send(loginPage({ params: rest, error: 'Wrong password.' }));
+  const { password, ...rest } = p;
+  const requester = describeRequester(p);
+  const source = req.ip || 'unknown';
+  const limiterKeys = [GLOBAL_KEY, `addr:${source}`];
+
+  // Checked before any hashing, so a blocked source costs nothing to turn away.
+  const retryAfter = loginRetryAfter(limiterKeys);
+  if (retryAfter > 0) {
+    console.log(`login rate limited (429) from ${source}, retry after ${retryAfter}s`);
+    res.set('Retry-After', String(retryAfter));
+    return res.status(429).type('html').send(
+      loginPage({ params: rest, error: 'Too many failed attempts. Try again later.', requester })
+    );
   }
+
+  // Counted before the hash rather than after it: hashing is async, so a burst
+  // of parallel guesses would otherwise all pass the check above together.
+  recordLoginFailure(limiterKeys);
+  if (!(await verifyPassword(String(password || '')))) {
+    console.log(`login failed from ${source}`);
+    return res.status(401).type('html').send(loginPage({ params: rest, error: 'Wrong password.', requester }));
+  }
+  for (const key of limiterKeys) loginFailures.delete(key);
 
   const code = newSecret();
   db.prepare(
