@@ -19,16 +19,24 @@
 
 ## Architecture
 
-- `auth-server.js` is the only security boundary: OAuth 2.1 authorization server plus resource guard, proxying to supergateway on :8420
+- `auth-server.js` is the only network security boundary: OAuth 2.1 authorization server plus resource guard, proxying to supergateway on :8420
 - Port 8420 has no authentication at all and must never be exposed
 - Two credential paths by design: OAuth for Claude.ai, static bearer token for Claude Code
 - Tokens and authorization codes are stored as SHA-256 hashes in SQLite
 - Single user by design - "authentication" is proving you know one password, there are no accounts
+- `vault-mcp.js` is the MCP server over the vault, stdio only, no auth of its own. Tools live in `lib/tools/`, shared parsing in `lib/`
+- Every tool advertises a `vault` property, because `relaxVaultRequirement` in the auth server keys off it to inject `DEFAULT_VAULT`
+- Listings, tags, links and search all read one index in `lib/vault.js`. Every write calls `vault.invalidate()`
+- `npm test` runs the whole tool surface through a real MCP client against a throwaway vault. Add a case there for anything new
 
 ## Security invariants
 
 Do not weaken these without a deliberate decision:
 
+- Every filesystem path goes through `resolveInVault`, which resolves symlinks and proves containment
+- `.obsidian` is never written to
+- Deletes move to `.trash` unless the caller asks for `permanent`
+- Writes are temp-file-then-rename, never truncate in place
 - PKCE `S256` only, never `plain`
 - Redirect URIs matched exactly, never by prefix
 - Authorization codes single use, deleted on first sight

@@ -1,3 +1,32 @@
+### 1.5.0: 2026-10-24
+
+* Add Obsidian canvas support
+* Create canvases from notes and their links
+* Lay out canvas nodes automatically
+* Replace obsidian-mcp with an own vault server
+* Add heading-scoped editing with `patch-note`
+* Add find and replace within a note
+* Add frontmatter property editing
+* Add backlinks and outgoing links
+* Add broken and orphaned note reports
+* Add tag listing with counts
+* Add folder browsing, moving and deleting
+* Add daily note reading and appending
+* Add attachment listing and reading
+* Add recent notes and vault stats
+* Add batch note reading
+* Add note outlines
+* Add copy-note
+* Filter search by tag, property, folder and date
+* Rewrite links when a folder moves
+* Keep unknown canvas fields on edit
+* Refuse writes into `.obsidian`
+* Refuse paths escaping the vault through symlinks
+* Write notes atomically
+* Serve a page at the site root for connector icons
+* Drop the install-time patches
+* Add an end-to-end test suite
+
 ### 1.4.3: 2026-09-27
 
 * Reap sessions whose clients disconnect

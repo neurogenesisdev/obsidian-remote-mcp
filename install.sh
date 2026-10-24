@@ -87,12 +87,13 @@ while [ -z "$VAULT" ]; do
   [ -z "$VAULT" ] && { warn "A vault path is required."; continue; }
   VAULT="${VAULT/#\~/$HOME}"
   if [ ! -d "$VAULT" ]; then warn "No such directory: $VAULT"; VAULT=""; continue; fi
-  # Not fatal: obsidian-mcp reads plain markdown, an .obsidian folder only means
-  # the vault has been opened in the app at least once.
+  # Not fatal: the vault server reads plain markdown, an .obsidian folder only
+  # means the vault has been opened in the app at least once. It is read for the
+  # daily-note format and the attachment folder when it is there.
   [ -d "$VAULT/.obsidian" ] || warn "No .obsidian folder there - is that really a vault?"
 done
-# obsidian-mcp registers a vault under a slug of its folder name, so
-# "My Notes" is addressed as "my-notes".
+# A vault is addressed by a slug of its folder name, so "My Notes" becomes
+# "my-notes".
 VAULT_SLUG=$(basename "$VAULT" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]\n' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')
 ok "vault: $VAULT (as \"$VAULT_SLUG\")"
 
@@ -163,7 +164,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$NODE_BIN $INSTALL_DIR/node_modules/supergateway/dist/index.js \\
-  --stdio "$NODE_BIN $INSTALL_DIR/node_modules/obsidian-mcp/build/main.js '$VAULT'" \\
+  --stdio "$NODE_BIN $INSTALL_DIR/vault-mcp.js '$VAULT'" \\
   --outputTransport streamableHttp \\
   --port $MCP_PORT \\
   --stateful \\

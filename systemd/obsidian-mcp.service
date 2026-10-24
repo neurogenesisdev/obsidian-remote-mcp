@@ -8,7 +8,7 @@ Type=simple
 User=YOUR_USER
 WorkingDirectory=/home/YOUR_USER/obsidian-remote-mcp
 ExecStart=/usr/bin/node /home/YOUR_USER/obsidian-remote-mcp/node_modules/supergateway/dist/index.js \
-  --stdio "/usr/bin/node /home/YOUR_USER/obsidian-remote-mcp/node_modules/obsidian-mcp/build/main.js '/home/YOUR_USER/Documents/YourVault'" \
+  --stdio "/usr/bin/node /home/YOUR_USER/obsidian-remote-mcp/vault-mcp.js '/home/YOUR_USER/Documents/YourVault'" \
   --outputTransport streamableHttp \
   --port 8420 \
   --stateful \
