@@ -185,8 +185,10 @@ function makeLimiter(perAddressLimit, globalLimit) {
         else counts.set(key, { count: 1, start: t });
       }
     },
+    // Only the source's own window: clearing the global one too would hand a
+    // spread-out guesser a fresh budget every time the owner signs in.
     reset(source) {
-      for (const key of keysFor(source)) counts.delete(key);
+      counts.delete(`addr:${source}`);
     },
   };
 }
