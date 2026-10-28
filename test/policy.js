@@ -71,8 +71,11 @@ async function main() {
     'CLAUDE.md': '# rules\n',
     'areas/x/_index.md': '# x\n\n[[notes/Target]] #topic\n',
     'areas/box/state/facts.md': 'measured\n',
+    'areas/box/state/ref.md': '[[notes/Target]] #topic\n',
     'notes/Target.md': '# Target\n\nkeyword-target\n',
     'notes/Other.md': '# Other\n\n[target](Target.md) #topic\n',
+    'notes/Linked.md': '# Linked\n\n[[notes/Target]] #topic\n',
+    'site.v2/page.md': '# page\n',
     '_generated/out.md': 'keyword-generated\n',
     '_meta/scratch/s.md': 'keyword-scratch\n',
     '.claude/settings.json': '{}',
@@ -84,6 +87,9 @@ async function main() {
   fs.symlinkSync('../areas/box/state/planted.md', path.join(notes, 'notes/dangling.md'));
   fs.symlinkSync('../_generated', path.join(notes, 'notes/gen'));
   fs.symlinkSync('Target.md', path.join(notes, 'notes/alias.md'));
+  // Points into a read-only folder, so no writer rewrites the target first and
+  // leaves the link with nothing to change.
+  fs.symlinkSync('../areas/box/state/ref.md', path.join(notes, 'notes/shortcut.md'));
   writeTree(code, {
     'src/a.md': '# a\n',
     'node_modules/pkg/readme.md': 'dependency\n',
@@ -117,6 +123,13 @@ async function main() {
   );
   const call = (name, args = {}) => client.callTool({ name, arguments: args });
   const read = (rel) => fs.readFileSync(path.join(notes, rel), 'utf8');
+  const isLink = (rel) => {
+    try {
+      return fs.lstatSync(path.join(notes, rel)).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
   const index = read('areas/x/_index.md');
 
   await test('disabled tools are not listed', async () => {
@@ -174,6 +187,57 @@ async function main() {
     assert.ok(!fs.existsSync(path.join(notes, 'areas/box/state/planted.md')));
     assert.ok(read('notes/Target.md').includes('# Target'));
   });
+  await test('refusing a link does not point the caller at its target', async () => {
+    const result = await call('create-note', { vault: 'notes', path: 'notes/alias.md', content: 'x', overwrite: true });
+    expectError(result, 'link');
+    assert.ok(!/points? at|instead/.test(textOf(result)), textOf(result));
+  });
+  await test('one bad path does not fail a batch read', async () => {
+    const out = expectOk(await call('read-notes', {
+      vault: 'notes',
+      paths: ['notes/dangling.md', '_generated/out.md', 'notes/Other.md', 'missing.md'],
+    }));
+    assert.ok(out.includes('broken link'), out);
+    assert.ok(out.includes('not available') && !out.includes('keyword-generated'), out);
+    assert.ok(out.includes('# Other') && out.includes('[not found]'), out);
+    assert.ok(!out.includes(root), out);
+  });
+  await test('a link cannot be moved, and the refusal leaves it in place', async () => {
+    expectError(await call('move-note', { vault: 'notes', source: 'notes/alias.md', destination: 'notes/alias2.md' }), 'link');
+    assert.ok(isLink('notes/alias.md') && !fs.existsSync(path.join(notes, 'notes/alias2.md')));
+  });
+  await test('deleting a link removes the link, never its target', async () => {
+    expectOk(await call('delete-note', { vault: 'notes', path: 'notes/link.md' }));
+    assert.ok(!isLink('notes/link.md'));
+    assert.strictEqual(fs.readFileSync(path.join(notes, '_generated/out.md'), 'utf8'), 'keyword-generated\n');
+    assert.ok(!fs.existsSync(path.join(notes, '.trash')), 'link was moved to .trash');
+  });
+  await test('a broken link can be removed', async () => {
+    expectOk(await call('edit-note', { vault: 'notes', path: 'notes/dangling.md', operation: 'delete' }));
+    assert.ok(!isLink('notes/dangling.md'));
+    assert.ok(!fs.existsSync(path.join(notes, 'areas/box/state/planted.md')));
+  });
+  await test('note tools refuse a folder whose name looks like a file', async () => {
+    expectError(await call('delete-note', { vault: 'notes', path: 'site.v2' }), 'folder');
+    expectError(await call('delete-note', { vault: 'notes', path: 'site.v2', permanent: true }), 'folder');
+    expectError(await call('edit-note', { vault: 'notes', path: 'site.v2', operation: 'delete' }), 'folder');
+    expectError(await call('move-note', { vault: 'notes', source: 'site.v2', destination: 'site.v3' }), 'folder');
+    assert.strictEqual(read('site.v2/page.md'), '# page\n');
+    assert.ok(!fs.existsSync(path.join(notes, 'site.v3')));
+  });
+  await test('a delete is refused when .trash goes through a link', async () => {
+    expectOk(await call('create-note', { vault: 'notes', path: 'notes/Doomed.md', content: 'keep me' }));
+    fs.symlinkSync('areas/box/state', path.join(notes, '.trash'));
+    try {
+      expectError(await call('delete-note', { vault: 'notes', path: 'notes/Doomed.md' }), '.trash');
+      assert.strictEqual(read('notes/Doomed.md'), 'keep me');
+      assert.ok(!fs.existsSync(path.join(notes, 'areas/box/state/notes')), 'folder made through the link');
+    } finally {
+      fs.unlinkSync(path.join(notes, '.trash'));
+    }
+    expectOk(await call('delete-note', { vault: 'notes', path: 'notes/Doomed.md' }));
+    assert.strictEqual(read('.trash/notes/Doomed.md'), 'keep me');
+  });
   await test('nothing can be created in a denied folder', async () => {
     expectError(await call('create-note', { vault: 'notes', path: '_generated/new.md', content: 'x' }), 'not available');
     assert.ok(!fs.existsSync(path.join(notes, '_generated/new.md')));
@@ -195,12 +259,18 @@ async function main() {
     assert.ok(msg.includes('read-only'), msg);
     assert.strictEqual(read('areas/x/_index.md'), index);
     assert.ok(read('notes/Other.md').includes('Moved.md'), read('notes/Other.md'));
+    assert.ok(isLink('notes/shortcut.md'), 'the link rewrite replaced a link with a copy');
+    assert.strictEqual(read('areas/box/state/ref.md'), '[[notes/Target]] #topic\n');
+    assert.strictEqual(read('notes/Linked.md'), '# Linked\n\n[[Moved]] #topic\n');
   });
   await test('a tag rename leaves read-only notes alone and says so', async () => {
     const msg = expectOk(await call('rename-tag', { vault: 'notes', oldTag: 'topic', newTag: 'subject' }));
     assert.ok(msg.includes('read-only'), msg);
     assert.strictEqual(read('areas/x/_index.md'), index);
     assert.ok(read('notes/Other.md').includes('#subject'));
+    assert.ok(read('notes/Linked.md').includes('#subject'));
+    assert.ok(isLink('notes/shortcut.md'), 'the tag rename replaced a link with a copy');
+    assert.strictEqual(read('areas/box/state/ref.md'), '[[notes/Target]] #topic\n');
   });
   await test('a read-only vault serves reads and refuses writes', async () => {
     expectOk(await call('read-note', { vault: 'code', path: 'src/a.md' }));
@@ -228,6 +298,13 @@ async function main() {
     const run = startFails(bad, notes);
     assert.notStrictEqual(run.code, 0);
     assert.ok(run.stderr.includes('not being served'), run.stderr);
+  });
+  await test('a served vault with no policy entry stops startup', async () => {
+    const bad = path.join(root, 'no-entry.json');
+    fs.writeFileSync(bad, JSON.stringify({ vaults: { '*': { deny: ['.git'] } } }));
+    const run = startFails(bad, notes);
+    assert.notStrictEqual(run.code, 0);
+    assert.ok(run.stderr.includes('no entry for served vault(s): notes'), run.stderr);
   });
   await test('an unreadable policy stops startup', async () => {
     const run = startFails(path.join(root, 'missing.json'), notes);

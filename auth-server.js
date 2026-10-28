@@ -13,6 +13,7 @@ const path = require('path');
 const os = require('os');
 const util = require('util');
 const Database = require('better-sqlite3');
+const { makeLimiter } = require('./lib/limiter');
 
 const PORT = Number(process.env.PORT || 8422);
 const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:8420';
@@ -153,48 +154,8 @@ async function verifyPassword(candidate) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// A fixed-window counter per source address plus one global counter. The global
-// one caps the total no matter how many addresses the traffic comes from.
-const GLOBAL_KEY = 'global';
-
-function makeLimiter(perAddressLimit, globalLimit) {
-  const counts = new Map();
-  const keysFor = (source) => [GLOBAL_KEY, `addr:${source}`];
-  return {
-    // Seconds until this source may try again, 0 when it is not blocked.
-    retryAfter(source) {
-      const t = Date.now();
-      let wait = 0;
-      for (const key of keysFor(source)) {
-        const entry = counts.get(key);
-        const limit = key === GLOBAL_KEY ? globalLimit : perAddressLimit;
-        if (!entry || entry.count < limit) continue;
-        wait = Math.max(wait, entry.start + RATE_WINDOW_MS - t);
-      }
-      return Math.max(0, Math.ceil(wait / 1000));
-    },
-    record(source) {
-      const t = Date.now();
-      // Dropping lapsed windows here keeps the map from growing with every address seen.
-      for (const [key, entry] of counts) {
-        if (t - entry.start >= RATE_WINDOW_MS) counts.delete(key);
-      }
-      for (const key of keysFor(source)) {
-        const entry = counts.get(key);
-        if (entry) entry.count += 1;
-        else counts.set(key, { count: 1, start: t });
-      }
-    },
-    // Only the source's own window: clearing the global one too would hand a
-    // spread-out guesser a fresh budget every time the owner signs in.
-    reset(source) {
-      counts.delete(`addr:${source}`);
-    },
-  };
-}
-
-const loginLimiter = makeLimiter(LOGIN_MAX_FAILURES, MAX_LOGIN_ATTEMPTS_GLOBAL);
-const registrationLimiter = makeLimiter(MAX_REGISTRATIONS_PER_ADDRESS, MAX_REGISTRATIONS_GLOBAL);
+const loginLimiter = makeLimiter(LOGIN_MAX_FAILURES, MAX_LOGIN_ATTEMPTS_GLOBAL, RATE_WINDOW_MS);
+const registrationLimiter = makeLimiter(MAX_REGISTRATIONS_PER_ADDRESS, MAX_REGISTRATIONS_GLOBAL, RATE_WINDOW_MS);
 
 function readStaticToken() {
   try {

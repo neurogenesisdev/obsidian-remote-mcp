@@ -84,6 +84,14 @@ async function main() {
     log(`cannot start: policy disables unknown tool(s): ${unknown.join(', ')}`);
     process.exit(1);
   }
+  // A vault with no entry would get only the "*" rules, which is easy to miss
+  // when a vault is added or its folder renamed. An empty entry says it is meant.
+  const ruled = new Set(policy.vaultNames());
+  const unruled = policy.active ? [...vaults.keys()].filter((name) => !ruled.has(name)) : [];
+  if (unruled.length) {
+    log(`cannot start: policy has no entry for served vault(s): ${unruled.join(', ')} (an empty {} entry serves one under the "*" rules alone)`);
+    process.exit(1);
+  }
   const active = TOOLS.filter((tool) => !policy.isToolDisabled(tool.name));
   const byName = new Map(active.map((tool) => [tool.name, tool]));
 
