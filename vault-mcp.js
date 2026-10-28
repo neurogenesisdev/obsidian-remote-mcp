@@ -67,6 +67,12 @@ async function main() {
     process.exit(1);
   }
 
+  const unserved = policy.vaultNames().filter((name) => !vaults.has(name));
+  if (unserved.length) {
+    log(`cannot start: policy names vault(s) not being served: ${unserved.join(', ')}`);
+    process.exit(1);
+  }
+
   const all = new Set(TOOLS.map((tool) => tool.name));
   if (all.size !== TOOLS.length) {
     log('duplicate tool name in the registry');

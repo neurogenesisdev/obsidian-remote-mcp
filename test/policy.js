@@ -79,6 +79,11 @@ async function main() {
     '.env': 'SECRET=1\n',
   });
   fs.symlinkSync('../_generated/out.md', path.join(notes, 'notes/link.md'));
+  fs.writeFileSync(path.join(root, 'outside.md'), 'keyword-outside\n');
+  fs.symlinkSync('../../outside.md', path.join(notes, 'notes/outside.md'));
+  fs.symlinkSync('../areas/box/state/planted.md', path.join(notes, 'notes/dangling.md'));
+  fs.symlinkSync('../_generated', path.join(notes, 'notes/gen'));
+  fs.symlinkSync('Target.md', path.join(notes, 'notes/alias.md'));
   writeTree(code, {
     'src/a.md': '# a\n',
     'node_modules/pkg/readme.md': 'dependency\n',
@@ -141,11 +146,33 @@ async function main() {
     const all = expectOk(await call('list-directory', { vault: 'notes', recursive: true }));
     assert.ok(!all.includes('_generated') && !all.includes('_meta/scratch'), all);
   });
-  await test('denied files are not searched', async () => {
+  await test('denied files are not searched, not even through a link', async () => {
     const hits = expectOk(await call('search-vault', { vault: 'notes', query: 'keyword-generated' }));
-    assert.ok(!hits.includes('_generated'), hits);
+    assert.ok(!hits.includes('keyword-generated'), hits);
     const found = expectOk(await call('search-vault', { vault: 'notes', query: 'keyword-target' }));
     assert.ok(found.includes('Target'), found);
+  });
+  await test('a link out of the vault is neither indexed nor read', async () => {
+    const hits = expectOk(await call('search-vault', { vault: 'notes', query: 'keyword-outside' }));
+    assert.ok(!hits.includes('keyword-outside'), hits);
+    expectError(await call('read-note', { vault: 'notes', path: 'notes/outside.md' }), 'escapes');
+  });
+  await test('links to denied or outside targets are not listed', async () => {
+    const list = expectOk(await call('list-directory', { vault: 'notes', path: 'notes' }));
+    for (const name of ['gen', 'outside.md', 'link.md', 'dangling.md']) {
+      assert.ok(!list.includes(name), `${name} listed: ${list}`);
+    }
+    assert.ok(list.includes('alias.md'), list);
+  });
+  await test('a link to an allowed note still reads', async () => {
+    assert.ok(expectOk(await call('read-note', { vault: 'notes', path: 'notes/alias.md' })).includes('# Target'));
+  });
+  await test('nothing is written through a link, broken or not', async () => {
+    expectError(await call('copy-note', { vault: 'notes', source: 'notes/Other.md', destination: 'notes/dangling.md' }), 'link');
+    expectError(await call('create-note', { vault: 'notes', path: 'notes/dangling.md', content: 'x', overwrite: true }), 'link');
+    expectError(await call('create-note', { vault: 'notes', path: 'notes/alias.md', content: 'x', overwrite: true }), 'link');
+    assert.ok(!fs.existsSync(path.join(notes, 'areas/box/state/planted.md')));
+    assert.ok(read('notes/Target.md').includes('# Target'));
   });
   await test('nothing can be created in a denied folder', async () => {
     expectError(await call('create-note', { vault: 'notes', path: '_generated/new.md', content: 'x' }), 'not available');
@@ -194,6 +221,13 @@ async function main() {
     const run = startFails(bad, notes);
     assert.notStrictEqual(run.code, 0);
     assert.ok(run.stderr.includes('unknown tool'), run.stderr);
+  });
+  await test('a policy naming a vault that is not served stops startup', async () => {
+    const bad = path.join(root, 'bad-vault.json');
+    fs.writeFileSync(bad, JSON.stringify({ vaults: { repos: { deny: ['dist'] } } }));
+    const run = startFails(bad, notes);
+    assert.notStrictEqual(run.code, 0);
+    assert.ok(run.stderr.includes('not being served'), run.stderr);
   });
   await test('an unreadable policy stops startup', async () => {
     const run = startFails(path.join(root, 'missing.json'), notes);
