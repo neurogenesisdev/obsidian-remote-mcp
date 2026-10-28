@@ -19,6 +19,7 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 
 const { createRegistry } = require('./lib/vault');
+const { callerMessage } = require('./lib/tools/common');
 const policy = require('./lib/policy');
 const { check } = require('./lib/validate');
 const pkg = require('./package.json');
@@ -118,9 +119,8 @@ async function main() {
       // Returned as a tool result rather than a JSON-RPC error: the caller can
       // read what went wrong and try again, instead of the client treating the
       // whole request as failed.
-      const message = err instanceof McpError ? err.message.replace(/^MCP error -?\d+:\s*/, '') : err.message;
-      log(`${tool.name} failed: ${message}`);
-      return { content: [{ type: 'text', text: message }], isError: true };
+      log(`${tool.name} failed: ${err.message}`);
+      return { content: [{ type: 'text', text: callerMessage(err) }], isError: true };
     }
   });
 

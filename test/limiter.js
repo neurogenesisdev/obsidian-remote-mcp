@@ -58,5 +58,11 @@ test('the wait never exceeds the window', () => {
   assert.ok(wait > 0 && wait <= WINDOW / 1000, String(wait));
 });
 
+test('a missing or bad setting is refused rather than failing open', () => {
+  assert.throws(() => makeLimiter(10, 100), /windowMs/);
+  assert.throws(() => makeLimiter('10', 100, WINDOW), /perAddressLimit/);
+  assert.throws(() => makeLimiter(10, 0, WINDOW), /globalLimit/);
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 if (failed) process.exit(1);

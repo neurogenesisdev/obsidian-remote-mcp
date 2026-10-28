@@ -86,6 +86,7 @@ async function main() {
   fs.symlinkSync('../../outside.md', path.join(notes, 'notes/outside.md'));
   fs.symlinkSync('../areas/box/state/planted.md', path.join(notes, 'notes/dangling.md'));
   fs.symlinkSync('../_generated', path.join(notes, 'notes/gen'));
+  fs.symlinkSync('../areas/box', path.join(notes, 'notes/box.d'));
   fs.symlinkSync('Target.md', path.join(notes, 'notes/alias.md'));
   // Points into a read-only folder, so no writer rewrites the target first and
   // leaves the link with nothing to change.
@@ -195,8 +196,9 @@ async function main() {
   await test('one bad path does not fail a batch read', async () => {
     const out = expectOk(await call('read-notes', {
       vault: 'notes',
-      paths: ['notes/dangling.md', '_generated/out.md', 'notes/Other.md', 'missing.md'],
+      paths: ['notes/dangling.md', '_generated/out.md', 'notes/Other.md', 'missing.md', 'notes/Other.md/x.md'],
     }));
+    assert.ok(out.includes('[The server could not complete this (ENOTDIR).]'), out);
     assert.ok(out.includes('broken link'), out);
     assert.ok(out.includes('not available') && !out.includes('keyword-generated'), out);
     assert.ok(out.includes('# Other') && out.includes('[not found]'), out);
@@ -216,6 +218,26 @@ async function main() {
     expectOk(await call('edit-note', { vault: 'notes', path: 'notes/dangling.md', operation: 'delete' }));
     assert.ok(!isLink('notes/dangling.md'));
     assert.ok(!fs.existsSync(path.join(notes, 'areas/box/state/planted.md')));
+  });
+  await test('raw filesystem errors are not passed on', async () => {
+    const result = await call('delete-note', { vault: 'notes', path: 'notes/Other.md/x.md' });
+    expectError(result, 'ENOTDIR');
+    assert.ok(!textOf(result).includes(root), textOf(result));
+  });
+  await test('a link in a parent folder is still checked when acting on an entry', async () => {
+    expectError(await call('delete-note', { vault: 'notes', path: 'notes/gen/out.md' }), 'not available');
+    expectError(await call('move-note', { vault: 'notes', source: 'notes/gen/out.md', destination: 'notes/out.md' }), 'not available');
+    assert.strictEqual(fs.readFileSync(path.join(notes, '_generated/out.md'), 'utf8'), 'keyword-generated\n');
+  });
+  await test('a link to a folder is refused like the folder', async () => {
+    expectError(await call('delete-note', { vault: 'notes', path: 'notes/box.d' }), 'folder');
+    expectError(await call('edit-note', { vault: 'notes', path: 'notes/box.d', operation: 'delete' }), 'folder');
+    expectError(await call('move-note', { vault: 'notes', source: 'notes/box.d', destination: 'notes/box.e' }), 'link');
+    assert.ok(isLink('notes/box.d'));
+  });
+  await test('the delete-note description says links are not trashed', async () => {
+    const tool = (await client.listTools()).tools.find((t) => t.name === 'delete-note');
+    assert.ok(/link is the exception/i.test(tool.description), tool.description);
   });
   await test('note tools refuse a folder whose name looks like a file', async () => {
     expectError(await call('delete-note', { vault: 'notes', path: 'site.v2' }), 'folder');
