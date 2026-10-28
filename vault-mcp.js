@@ -19,6 +19,7 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 
 const { createRegistry } = require('./lib/vault');
+const policy = require('./lib/policy');
 const { check } = require('./lib/validate');
 const pkg = require('./package.json');
 
@@ -59,17 +60,26 @@ async function main() {
 
   let vaults;
   try {
+    policy.load();
     vaults = createRegistry(paths);
   } catch (err) {
     log(`cannot start: ${err.message}`);
     process.exit(1);
   }
 
-  const byName = new Map(TOOLS.map((tool) => [tool.name, tool]));
-  if (byName.size !== TOOLS.length) {
+  const all = new Set(TOOLS.map((tool) => tool.name));
+  if (all.size !== TOOLS.length) {
     log('duplicate tool name in the registry');
     process.exit(1);
   }
+  // A misspelt name would leave the tool it meant switched on, so refuse it.
+  const unknown = policy.disabledTools().filter((name) => !all.has(name));
+  if (unknown.length) {
+    log(`cannot start: policy disables unknown tool(s): ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+  const active = TOOLS.filter((tool) => !policy.isToolDisabled(tool.name));
+  const byName = new Map(active.map((tool) => [tool.name, tool]));
 
   const server = new Server(
     { name: 'obsidian-vault-mcp', version: pkg.version },
@@ -77,7 +87,7 @@ async function main() {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    tools: active.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -101,7 +111,8 @@ async function main() {
   });
 
   await server.connect(new StdioServerTransport());
-  log(`serving ${vaults.size} vault(s): ${[...vaults.keys()].join(', ')} - ${TOOLS.length} tools`);
+  log(`serving ${vaults.size} vault(s): ${[...vaults.keys()].join(', ')} - ${active.length} tools` +
+    (policy.active ? ' - policy on' : ''));
 
   for (const vault of vaults.values()) {
     vault.index().catch((err) => log(`initial index of ${vault.name} failed: ${err.message}`));
