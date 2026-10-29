@@ -598,6 +598,17 @@ async function main() {
     fs.symlinkSync(os.tmpdir(), path.join(vault, 'escape'));
     contains(expectError(await call('create-note', { path: 'escape/evil.md', content: 'x' }), 'create-note'), 'escapes the vault', 'message');
   });
+  await test('broken frontmatter is reported as such, not as a server failure', async () => {
+    const msg = expectError(
+      await call('create-note', { path: 'Broken.md', content: '---\nfoo: [unclosed\n---\nbody', frontmatter: { a: 1 } }),
+      'create-note'
+    );
+    contains(msg, 'not valid YAML', 'message');
+    assert.ok(!fs.existsSync(path.join(vault, 'Broken.md')), 'note was written');
+    fs.writeFileSync(path.join(vault, 'BrokenFm.md'), '---\nfoo: [unclosed\n---\nbody\n');
+    const out = await call('add-tags', { files: ['BrokenFm.md'], tags: ['x'] });
+    contains(JSON.stringify(out.content), 'not valid YAML', 'batch line');
+  });
   await test('a missing required argument is reported by name', async () => {
     contains(expectError(await call('read-notes', {}), 'read-notes'), '"paths" is required', 'message');
   });
